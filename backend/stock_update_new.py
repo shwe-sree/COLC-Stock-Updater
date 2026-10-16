@@ -1,178 +1,263 @@
-import io
-import re
-import zipfile
-from collections import Counter
 
+import streamlit as st
 import pandas as pd
 
+from backend.stock_update_new import process_stock
 
-CIGAR_PREFIXES = (
-    "Cuban Cigars->",
-    "Davidoff Cigars->",
-    "New World Cigars->",
+# ==========================================
+# 1. PAGE CONFIGURATION
+# ==========================================
+
+st.set_page_config(
+    page_title="City of London Cigars | Stock Updater",
+    page_icon="📦",
+    layout="wide"
 )
 
-REQUIRED_A = ("Barcode", "QTY", "Selling Price")
-REQUIRED_B = (
-    "ID", "Barcode", "Name", "Quantity", "Price", "Stock Status",
-    "With Storehouse Management", "Product Attributes", "Categories", "Tags",
+# ==========================================
+# 2. APPLICATION HEADER
+# ==========================================
+
+st.title("City of London Cigars")
+st.subheader("Stock Management System")
+
+st.write(
+    "Upload your supplier stock file and website "
+    "product export to update stock, prices and "
+    "generate category-wise CSV files."
 )
 
+st.divider()
 
-def _read_csv(source, label):
-    """Read a Streamlit UploadedFile, binary stream, path, or CSV bytes."""
-    if isinstance(source, bytes):
-        source = io.BytesIO(source)
-    if hasattr(source, "seek"):
-        source.seek(0)
-    try:
-        frame = pd.read_csv(source, dtype={"Barcode": "string"}, low_memory=False)
-    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeError) as exc:
-        raise ValueError(f"Cannot read {label} as a CSV: {exc}") from exc
-    frame.columns = frame.columns.str.strip()
-    return frame
+# ==========================================
+# 3. FILE UPLOAD
+# ==========================================
 
+col1, col2 = st.columns(2)
 
-def _safe_filename(name):
-    return re.sub(r'[<>:"/\\|?*]', "_", name).strip().rstrip(".") or "no_name"
+with col1:
+    st.markdown("#### Supplier Stock")
 
-
-def _category_prefix(category):
-    if not category:
-        return "no_name"
-    return str(category).split("->", 1)[0].strip() or "no_name"
-
-
-def process_stock(sheet_a, sheet_b):
-    """
-    Process supplier and website CSVs without writing to disk.
-
-    Returns a dictionary containing:
-      files: {filename: CSV bytes}
-      zip_bytes: ZIP archive bytes
-      summary: list of {Category, File, Rows}
-      total_rows, total_files, matched_barcodes, cigar_rows_adjusted
-    """
-    df_a = _read_csv(sheet_a, "Sheet A")
-    df_b = _read_csv(sheet_b, "Sheet B")
-
-    for label, df, required in (("Sheet A", df_a, REQUIRED_A), ("Sheet B", df_b, REQUIRED_B)):
-        missing = [col for col in required if col not in df.columns]
-        if missing:
-            raise ValueError(f"{label} is missing required columns: {', '.join(missing)}")
-
-    df_a["Barcode"] = df_a["Barcode"].fillna("").str.strip()
-    df_b["Barcode"] = df_b["Barcode"].fillna("").str.strip()
-    df_b["Name"] = df_b["Name"].fillna("").astype(str).str.strip()
-
-    # Preserve Version 2.1 behaviour: invalid/missing supplier quantities become zero.
-    df_a["QTY"] = pd.to_numeric(df_a["QTY"], errors="coerce").fillna(0)
-    df_a["Selling Price"] = pd.to_numeric(
-        df_a["Selling Price"].astype(str)
-        .str.replace("£", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .str.strip(),
-        errors="coerce",
+    sheet_a = st.file_uploader(
+        "Upload Sheet A",
+        type=["csv"],
+        key="supplier_file"
     )
 
-    working_df = df_b.copy()
-    matched_names = set()
-    matched_barcodes = set()
+with col2:
+    st.markdown("#### Website Products")
 
-    for _, supplier_row in df_a.iterrows():
-        barcode = supplier_row["Barcode"]
-        if not barcode:
-            continue
-        mask = working_df["Barcode"].eq(barcode).fillna(False)
-        if not mask.any():
-            continue
-        matched_barcodes.add(barcode)
-        matched_names.update(working_df.loc[mask, "Name"].tolist())
-        working_df.loc[mask, "Quantity"] = supplier_row["QTY"]
-        if pd.notna(supplier_row["Selling Price"]):
-            working_df.loc[mask, "Price"] = supplier_row["Selling Price"]
+    sheet_b = st.file_uploader(
+        "Upload Sheet B",
+        type=["csv"],
+        key="website_file"
+    )
 
-    output_df = working_df[working_df["Name"].isin(matched_names)].copy()
-    adjusted_count = 0
+# ==========================================
+# 4. FILE VALIDATION
+# ==========================================
 
-    if not output_df.empty:
-        output_df = output_df.drop_duplicates(subset=["ID"], keep="first").copy()
-        output_df["With Storehouse Management"] = 1
-        output_df["Quantity"] = pd.to_numeric(output_df["Quantity"], errors="coerce").fillna(0)
-        output_df["Stock Status"] = output_df["Quantity"].apply(
-            lambda qty: "out_of_stock" if qty == 0 else "in_stock"
+if sheet_a is not None:
+    st.success(
+        f"Supplier file uploaded: {sheet_a.name}"
+    )
+
+if sheet_b is not None:
+    st.success(
+        f"Website file uploaded: {sheet_b.name}"
+    )
+
+# ==========================================
+# 5. STOCK PROCESSING
+# ==========================================
+
+if "stock_result" not in st.session_state:
+    st.session_state.stock_result = None
+
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = None
+
+current_files = (
+    (sheet_a.name, sheet_a.getvalue())
+    if sheet_a is not None else None,
+    (sheet_b.name, sheet_b.getvalue())
+    if sheet_b is not None else None
+)
+
+# Clear previous results if uploaded files change
+if st.session_state.processed_files != current_files:
+    st.session_state.stock_result = None
+
+update_button = st.button(
+    "Update Stock",
+    type="primary",
+    use_container_width=True
+)
+
+if update_button:
+
+    if sheet_a is None or sheet_b is None:
+        st.error(
+            "Please upload both CSV files before "
+            "updating stock."
         )
 
-        attributes = output_df["Product Attributes"].fillna("").astype(str).str.strip()
-        main_product_mask = attributes.eq("Quantity")
-        output_df["_CleanCategory"] = output_df["Categories"].fillna("").astype(str).str.strip()
-
-        main_category_rows = output_df[
-            main_product_mask & output_df["_CleanCategory"].ne("")
-        ]
-        main_category_map = (
-            main_category_rows.drop_duplicates(subset=["Name"], keep="first")
-            .set_index("Name")["_CleanCategory"].to_dict()
-        )
-        family_category_rows = output_df[output_df["_CleanCategory"].ne("")]
-        family_category_map = (
-            family_category_rows.drop_duplicates(subset=["Name"], keep="first")
-            .set_index("Name")["_CleanCategory"].to_dict()
-        )
-
-        output_df["_FullCategory"] = output_df["Name"].map(
-            lambda name: main_category_map.get(name, "") or family_category_map.get(name, "")
-        )
-        cigar_category_mask = output_df["_FullCategory"].str.startswith(CIGAR_PREFIXES)
-        special_edition_mask = output_df["Tags"].fillna("").astype(str).str.contains(
-            "Special Edition", case=False, regex=False
-        )
-        adjustment_mask = (
-            cigar_category_mask & output_df["Quantity"].le(3) & ~special_edition_mask
-        )
-        adjusted_count = int(adjustment_mask.sum())
-        output_df.loc[adjustment_mask, "Quantity"] = 0
-        output_df.loc[adjustment_mask, "Stock Status"] = "out_of_stock"
-        output_df.loc[adjustment_mask, "With Storehouse Management"] = 1
-
-        repeated_products = output_df["Name"].duplicated(keep=False)
-        output_df.loc[repeated_products & main_product_mask, "Barcode"] = ""
-
-        output_df["_ExportCategory"] = output_df["_FullCategory"].map(_category_prefix)
-        group_order = {"Cuban Cigars": 0, "Davidoff Cigars": 1, "New World Cigars": 2}
-        output_df["_GroupOrder"] = output_df["_ExportCategory"].map(group_order).fillna(3)
-        output_df["_OriginalOrder"] = range(len(output_df))
-        output_df = output_df.sort_values(
-            by=["_GroupOrder", "Quantity", "_OriginalOrder"],
-            ascending=[True, False, True], kind="stable",
-        ).drop_duplicates(subset=["ID"], keep="first").reset_index(drop=True)
     else:
-        output_df["_ExportCategory"] = pd.Series(dtype="string")
+        try:
 
-    files = {}
-    summary = []
-    seen_filenames = set()
-    for category, group in output_df.groupby("_ExportCategory", sort=True):
-        filename = f"{_safe_filename(category)}.csv"
-        if filename.casefold() in seen_filenames:
-            raise ValueError(f"Two categories produce the same filename: {filename}")
-        seen_filenames.add(filename.casefold())
-        export_df = group.reindex(columns=df_b.columns).copy()
-        csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
-        files[filename] = csv_bytes
-        summary.append({"Category": category, "File": filename, "Rows": len(export_df)})
+            with st.spinner(
+                "Processing stock updates. Please wait..."
+            ):
 
-    archive_buffer = io.BytesIO()
-    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for filename, content in files.items():
-            archive.writestr(filename, content)
+                result = process_stock(
+                    sheet_a,
+                    sheet_b
+                )
 
-    return {
-        "files": files,
-        "zip_bytes": archive_buffer.getvalue(),
-        "summary": summary,
-        "total_rows": sum(item["Rows"] for item in summary),
-        "total_files": len(files),
-        "matched_barcodes": len(matched_barcodes),
-        "cigar_rows_adjusted": adjusted_count,
-    }
+                st.session_state.stock_result = result
+                st.session_state.processed_files = (
+                    current_files
+                )
+
+            st.success(
+                "Stock processing completed successfully!"
+            )
+
+        except Exception as error:
+
+            st.session_state.stock_result = None
+
+            st.error(
+                f"Stock processing failed: {error}"
+            )
+
+# ==========================================
+# 6. DISPLAY PROCESSING RESULTS
+# ==========================================
+
+result = st.session_state.stock_result
+
+if result is not None:
+
+    st.divider()
+
+    st.header("Stock Update Summary")
+
+    # Summary metrics
+    metric1, metric2, metric3, metric4 = (
+        st.columns(4)
+    )
+
+    with metric1:
+        st.metric(
+            "CSV Files",
+            result["total_files"]
+        )
+
+    with metric2:
+        st.metric(
+            "Exported Rows",
+            result["total_rows"]
+        )
+
+    with metric3:
+        st.metric(
+            "Matched Barcodes",
+            result["matched_barcodes"]
+        )
+
+    with metric4:
+        st.metric(
+            "Cigar Rows Adjusted",
+            result["cigar_rows_adjusted"]
+        )
+
+    # ======================================
+    # 7. CATEGORY-WISE ROW COUNTS
+    # ======================================
+
+    st.subheader("Category-wise CSV Files")
+
+    summary_df = pd.DataFrame(
+        result["summary"]
+    )
+
+    if not summary_df.empty:
+
+        summary_df = summary_df.rename(
+            columns={
+                "Category": "Category",
+                "File": "CSV Filename",
+                "Rows": "Total Rows"
+            }
+        )
+
+        st.dataframe(
+            summary_df[
+                [
+                    "Category",
+                    "CSV Filename",
+                    "Total Rows"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+        st.warning(
+            "No matching products were found. "
+            "No category CSV files were generated."
+        )
+
+    # ======================================
+    # 8. DOWNLOAD ALL CSV FILES
+    # ======================================
+
+    if result["total_files"] > 0:
+
+        st.divider()
+
+        st.subheader("Download Updated Stock")
+
+        st.download_button(
+            label="Download All CSV Files (ZIP)",
+            data=result["zip_bytes"],
+            file_name="COLC_Stock_Update.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+        # ==================================
+        # 9. INDIVIDUAL CSV DOWNLOADS
+        # ==================================
+
+        with st.expander(
+            "Download Individual Category CSV Files"
+        ):
+
+            for filename, file_data in (
+                result["files"].items()
+            ):
+
+                st.download_button(
+                    label=f"Download {filename}",
+                    data=file_data,
+                    file_name=filename,
+                    mime="text/csv",
+                    key=f"download_{filename}",
+                    use_container_width=True
+                )
+
+# ==========================================
+# 10. FOOTER
+# ==========================================
+
+st.divider()
+
+st.caption(
+    "City of London Cigars | "
+    "Stock Management System | Version 1.0"
+)
+
